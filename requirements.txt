@@ -1,0 +1,4 @@
+# The bridge and webhook proxy use only the AWS SDK for Python (boto3), which ships
+# in the AWS Lambda Python runtime. A boto3 version that includes the DevOps Agent
+# client (`devops-agent`) is required for list_journal_records / create_backlog_task.
+boto3>=1.43.72

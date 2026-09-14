@@ -1,0 +1,472 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  IDR ↔ DevOps Agent Integration Stack
+  
+  Two components in one stack:
+  1. WEBHOOK PROXY: Routes IDR alarms (CloudWatch + third-party APM) to DevOps Agent
+     for autonomous investigation via CreateBacklogTask API.
+  2. BRIDGE LAMBDA: Catches DevOps Agent investigation lifecycle events and publishes
+     them in IDR's EventBridge format so findings appear in the IDR case.
+  
+  Deploy in the same region as the DevOps Agent Space.
+
+Parameters:
+  AgentSpaceId:
+    Type: String
+    Description: Your DevOps Agent Space ID
+  AgentSpaceRegion:
+    Type: String
+    Description: Region where the Agent Space resides
+  AlarmNames:
+    Type: CommaDelimitedList
+    Default: ''
+    Description: >-
+      Comma-separated exact alarm names to route.
+      Leave empty if using AlarmPrefix.
+  AlarmPrefix:
+    Type: String
+    Default: ''
+    Description: >-
+      Prefix to match alarm names (e.g. "IDR-" matches all
+      alarms starting with that string). Leave empty if using AlarmNames.
+  APMEventBusName:
+    Type: String
+    Default: ''
+    Description: >-
+      Custom EventBridge bus name deployed by the IDR CLI setup-apm command.
+      Follows the naming convention {APMName}-AWSIncidentDetectionResponse-EventBus
+      (e.g. "NewRelic-AWSIncidentDetectionResponse-EventBus").
+      Leave empty if not using third-party APM.
+  LogLevel:
+    Type: String
+    Description: Lambda log level for the bridge
+    Default: INFO
+    AllowedValues: [DEBUG, INFO, WARNING, ERROR]
+
+Conditions:
+  HasAlarmList: !Not [!Equals [!Select [0, !Ref AlarmNames], '']]
+  HasAlarmPrefix: !Not [!Equals [!Ref AlarmPrefix, '']]
+  HasAPM: !Not [!Equals [!Ref APMEventBusName, '']]
+
+Resources:
+
+  # ╔══════════════════════════════════════════════════════════════════════════════╗
+  # ║  COMPONENT 1: WEBHOOK PROXY — Alarm → DevOps Agent Investigation           ║
+  # ╚══════════════════════════════════════════════════════════════════════════════╝
+
+  TaskCreatorPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Allow the webhook proxy to create a DevOps Agent investigation task
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: aidevops:CreateBacklogTask
+            Resource: !Sub >-
+              arn:aws:aidevops:${AgentSpaceRegion}:${AWS::AccountId}:agentspace/${AgentSpaceId}
+
+  TaskCreatorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !Ref TaskCreatorPolicy
+
+  TaskCreatorFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      guard:
+        SuppressedRules:
+          - LAMBDA_DLQ_CHECK
+          - LAMBDA_INSIDE_VPC
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: >-
+              LAMBDA_INSIDE_VPC not applicable. This Lambda calls only public AWS
+              service API endpoints (devops-agent, events) and accesses no
+              VPC-resident resources. Placing it in a VPC would require NAT
+              gateways or interface VPC endpoints with zero security benefit for
+              this event-driven sample (no inbound network surface).
+      # LAMBDA_DLQ_CHECK suppressed above via guard.SuppressedRules (no cfn_nag
+      # W-id maps to the DLQ check). Idempotent, event-driven integration: a
+      # dropped event has no replay value - CloudWatch/APM alarms re-fire on the
+      # next evaluation period and DevOps Agent lifecycle events are correlated by
+      # the incident-detection-response-identifier, so a retried duplicate lands
+      # on the same incident. A DLQ would add infrastructure with no benefit.
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-webhook-proxy'
+      Runtime: python3.13
+      Handler: index.lambda_handler
+      Role: !GetAtt TaskCreatorRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      ReservedConcurrentExecutions: 10
+      Environment:
+        Variables:
+          AGENT_SPACE_ID: !Ref AgentSpaceId
+          AGENT_SPACE_REGION: !Ref AgentSpaceRegion
+      Code:
+        ZipFile: |
+          import json, os, boto3
+          client = boto3.client(
+              'devops-agent',
+              region_name=os.environ['AGENT_SPACE_REGION']
+          )
+          def lambda_handler(event, context):
+              source = event.get("source", "")
+              detail = event.get("detail", {})
+              if source == "GenericAPMEvent":
+                  # Third-party APM (Datadog, Dynatrace, Splunk, New Relic)
+                  incident_id = detail.get(
+                      "incident-detection-response-identifier",
+                      event.get("id")
+                  )
+                  title = f"APM Alert - {incident_id}"
+                  description = detail.get(
+                      "description", "Generic APM event received"
+                  )
+              else:
+                  # CloudWatch native alarm
+                  incident_id = detail.get("alarmName", event.get("id"))
+                  title = f"CloudWatch Alarm: {incident_id}"
+                  description = detail.get("state", {}).get(
+                      "reason", "Alarm state changed"
+                  )
+              print(json.dumps({
+                  "message": "Received IDR event",
+                  "source": source,
+                  "incidentId": incident_id,
+                  "region": event.get("region")
+              }))
+              resp = client.create_backlog_task(
+                  agentSpaceId=os.environ['AGENT_SPACE_ID'],
+                  taskType='INVESTIGATION',
+                  priority='HIGH',
+                  title=title,
+                  description=json.dumps({
+                      "summary": description,
+                      "incidentId": incident_id,
+                      "incidentRegion": event.get("region")
+                  })
+              )
+              print(json.dumps({"message": "Created task", "taskId": resp.get('taskId', resp.get('backlogTaskId', ''))}))
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({
+                      'taskId': resp.get('taskId', resp.get('backlogTaskId', ''))
+                  })
+              }
+
+  # --- CloudWatch Alarm Rules (exact names) ---
+  CloudWatchAlarmRule:
+    Type: AWS::Events::Rule
+    Condition: HasAlarmList
+    Properties:
+      Description: 'Route specific IDR alarms to DevOps Agent'
+      State: ENABLED
+      EventPattern:
+        source: [aws.cloudwatch]
+        detail-type: ['CloudWatch Alarm State Change']
+        detail:
+          alarmName: !Ref AlarmNames
+          state: { value: [ALARM] }
+      Targets:
+        - Arn: !GetAtt TaskCreatorFunction.Arn
+          Id: DevOpsAgentTarget
+
+  CloudWatchLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Condition: HasAlarmList
+    Properties:
+      FunctionName: !Ref TaskCreatorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt CloudWatchAlarmRule.Arn
+
+  # --- CloudWatch Alarm Rules (prefix match) ---
+  CloudWatchPrefixRule:
+    Type: AWS::Events::Rule
+    Condition: HasAlarmPrefix
+    Properties:
+      Description: 'Route IDR alarms by prefix to DevOps Agent'
+      State: ENABLED
+      EventPattern:
+        source: [aws.cloudwatch]
+        detail-type: ['CloudWatch Alarm State Change']
+        detail:
+          alarmName: [{ prefix: !Ref AlarmPrefix }]
+          state: { value: [ALARM] }
+      Targets:
+        - Arn: !GetAtt TaskCreatorFunction.Arn
+          Id: DevOpsAgentTarget
+
+  CloudWatchPrefixLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Condition: HasAlarmPrefix
+    Properties:
+      FunctionName: !Ref TaskCreatorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt CloudWatchPrefixRule.Arn
+
+  # --- Third-party APM Rule (custom EventBus from IDR CLI setup-apm) ---
+  GenericAPMRule:
+    Type: AWS::Events::Rule
+    Condition: HasAPM
+    Properties:
+      Name: !Sub 'da-apm-${APMEventBusName}'
+      EventBusName: !Ref APMEventBusName
+      EventPattern:
+        source: [GenericAPMEvent]
+        detail-type: ['ams.monitoring/generic-apm']
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt TaskCreatorFunction.Arn
+          Id: DevOpsAgentTarget
+
+  APMLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Condition: HasAPM
+    Properties:
+      FunctionName: !Ref TaskCreatorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !GetAtt GenericAPMRule.Arn
+
+  # ╔══════════════════════════════════════════════════════════════════════════════╗
+  # ║  COMPONENT 2: BRIDGE LAMBDA — DevOps Agent Events → IDR Format             ║
+  # ╚══════════════════════════════════════════════════════════════════════════════╝
+
+  BridgeLambdaPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Read DevOps Agent investigation results and publish IDR events
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - aidevops:GetBacklogTask
+              - aidevops:GetJournalRecord
+              - aidevops:ListJournalRecords
+            Resource: !Sub 'arn:aws:aidevops:${AgentSpaceRegion}:${AWS::AccountId}:agentspace/${AgentSpaceId}'
+          - Effect: Allow
+            Action:
+              - events:PutEvents
+            Resource: !Sub 'arn:aws:events:${AWS::Region}:${AWS::AccountId}:event-bus/default'
+
+  BridgeLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !Ref BridgeLambdaPolicy
+
+  # NOTE: The bridge Lambda code is too large for inline ZipFile (>4096 chars).
+  # Deploy using a packaged zip uploaded to S3, or use SAM/CDK.
+  # For quick testing, deploy lambda_function.py via the AWS Console or:
+  #   zip bridge.zip lambda_function.py
+  #   aws lambda update-function-code --function-name <name> --zip-file fileb://bridge.zip
+  #
+  # For the combined stack, use `aws cloudformation package` with CodeUri instead of ZipFile.
+  BridgeLambda:
+    Type: AWS::Lambda::Function
+    Metadata:
+      guard:
+        SuppressedRules:
+          - LAMBDA_DLQ_CHECK
+          - LAMBDA_INSIDE_VPC
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: >-
+              LAMBDA_INSIDE_VPC not applicable. This Lambda calls only public AWS
+              service API endpoints (devops-agent, events) and accesses no
+              VPC-resident resources. Placing it in a VPC would require NAT
+              gateways or interface VPC endpoints with zero security benefit for
+              this event-driven sample (no inbound network surface).
+      # LAMBDA_DLQ_CHECK suppressed above via guard.SuppressedRules (no cfn_nag
+      # W-id maps to the DLQ check). Idempotent, event-driven integration: a
+      # dropped event has no replay value - CloudWatch/APM alarms re-fire on the
+      # next evaluation period and DevOps Agent lifecycle events are correlated by
+      # the incident-detection-response-identifier, so a retried duplicate lands
+      # on the same incident. A DLQ would add infrastructure with no benefit.
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-idr-bridge'
+      Runtime: python3.13
+      Handler: index.handler
+      Role: !GetAtt BridgeLambdaRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      ReservedConcurrentExecutions: 10
+      Environment:
+        Variables:
+          LOG_LEVEL: !Ref LogLevel
+          AGENT_SPACE_ID: !Ref AgentSpaceId
+          AGENT_SPACE_REGION: !Ref AgentSpaceRegion
+      Code:
+        # When using `aws cloudformation package`, this becomes an S3 reference automatically:
+        # CodeUri: ./bridge/
+        # For manual deploy, zip and upload lambda_function.py
+        ZipFile: |
+          import json, os, logging, boto3
+          from datetime import datetime
+          logger = logging.getLogger()
+          logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
+          devops_agent = boto3.client("devops-agent", region_name=os.environ.get("AGENT_SPACE_REGION"))
+          events_client = boto3.client("events")
+          GENERIC_APM_SOURCE = "GenericAPMEvent"
+          GENERIC_APM_DETAIL_TYPE = "ams.monitoring/generic-apm"
+          def handler(event, context):
+              logger.info(json.dumps({"message": "Received DevOps Agent event", "detail_type": event.get("detail-type"), "task_id": event.get("detail", {}).get("metadata", {}).get("task_id")}))
+              detail_type = event.get("detail-type", "")
+              detail = event.get("detail", {})
+              metadata = detail.get("metadata", {})
+              data = detail.get("data", {})
+              agent_space_id = metadata.get("agent_space_id")
+              task_id = metadata.get("task_id")
+              execution_id = metadata.get("execution_id")
+              if not agent_space_id or not task_id:
+                  return {"statusCode": 400, "body": "Missing metadata"}
+              # Get alarm name from task title, strip webhook proxy prefixes
+              try:
+                  task_resp = devops_agent.get_backlog_task(agentSpaceId=agent_space_id, taskId=task_id)
+                  idr_id = task_resp.get("task", {}).get("title", task_id)
+                  if idr_id.startswith("CloudWatch Alarm: "):
+                      idr_id = idr_id[len("CloudWatch Alarm: "):]
+                  elif idr_id.startswith("APM Alert - "):
+                      idr_id = idr_id[len("APM Alert - "):]
+              except Exception as e:
+                  logger.warning(f"Could not get task title: {e}")
+                  idr_id = task_id
+              priority = data.get("priority", "UNKNOWN")
+              status = data.get("status", "")
+              now_ms = int(datetime.utcnow().timestamp() * 1000)
+              summary = ""
+              completed = False
+              if detail_type == "Investigation Completed":
+                  completed = True
+                  if execution_id:
+                      try:
+                          journal_resp = devops_agent.list_journal_records(
+                              agentSpaceId=agent_space_id, executionId=execution_id,
+                              recordType='investigation_summary_md')
+                          for record in journal_resp.get('records', []):
+                              if record.get('recordType') == 'investigation_summary_md':
+                                  summary = record.get('content', '')
+                                  break
+                      except Exception as e:
+                          logger.warning(f"list_journal_records failed: {e}")
+                  if not summary:
+                      try:
+                          task_resp2 = devops_agent.get_backlog_task(agentSpaceId=agent_space_id, taskId=task_id)
+                          summary = task_resp2.get("task", {}).get("description", "Investigation completed")
+                      except:
+                          summary = "Investigation completed"
+              elif detail_type in ("Investigation Created", "Investigation In Progress"):
+                  summary = f"DevOps Agent investigating (Priority: {priority}). Findings will follow."
+              else:
+                  summary = f"Investigation status: {status}"
+              # Build GenericAPM-compatible event
+              idr_event = {
+                  "Detail": json.dumps({
+                      "title": f"DevOps Agent Investigation - {idr_id}",
+                      "priority": priority,
+                      "state": "ACTIVATED",
+                      "sources": ["devops-agent"],
+                      "createdAt": now_ms, "updatedAt": now_ms,
+                      "incident-detection-response-identifier": idr_id,
+                      "description": summary,
+                      "investigationContext": {
+                          "investigationCompleted": completed,
+                          "taskId": task_id, "executionId": execution_id
+                      }
+                  }),
+                  "DetailType": GENERIC_APM_DETAIL_TYPE,
+                  "Source": GENERIC_APM_SOURCE,
+                  "EventBusName": "default"
+              }
+              resp = events_client.put_events(Entries=[idr_event])
+              event_id = resp["Entries"][0].get("EventId", "unknown")
+              logger.info(f"Published {detail_type} for {idr_id}: {event_id} (summary_len={len(summary)})")
+              return {"statusCode": 200, "body": f"Published {detail_type}", "event_id": event_id}
+
+  # --- EventBridge Rule: Catch ALL DevOps Agent Investigation Events ---
+  InvestigationEventsRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: 'Catch ALL DevOps Agent investigation lifecycle events and forward to IDR'
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.aidevops
+        detail-type:
+          - Investigation Created
+          - Investigation Priority Updated
+          - Investigation In Progress
+          - Investigation Completed
+          - Investigation Failed
+          - Investigation Timed Out
+          - Investigation Cancelled
+          - Investigation Pending Triage
+          - Investigation Linked
+          - Investigation Skipped
+        detail:
+          data:
+            task_type:
+              - INVESTIGATION
+      Targets:
+        - Arn: !GetAtt BridgeLambda.Arn
+          Id: IDRBridgeTarget
+
+  LambdaPermissionInvestigation:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref BridgeLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt InvestigationEventsRule.Arn
+
+Outputs:
+  # Webhook Proxy outputs
+  TaskCreatorFunctionArn:
+    Description: ARN of the webhook proxy Lambda (alarm → DA)
+    Value: !GetAtt TaskCreatorFunction.Arn
+
+  # Bridge outputs
+  BridgeLambdaArn:
+    Description: ARN of the IDR Bridge Lambda (DA → IDR)
+    Value: !GetAtt BridgeLambda.Arn
+
+  InvestigationRuleArn:
+    Description: EventBridge rule ARN for all investigation events
+    Value: !GetAtt InvestigationEventsRule.Arn
+
+  # Deployment info
+  DeployCommand:
+    Description: Example deploy command
+    Value: !Sub >-
+      aws cloudformation deploy --template-file template.yaml
+      --stack-name ${AWS::StackName}
+      --parameter-overrides AgentSpaceId=${AgentSpaceId}
+      AgentSpaceRegion=${AgentSpaceRegion} AlarmPrefix=IDR-
+      --capabilities CAPABILITY_IAM --region ${AWS::Region}
